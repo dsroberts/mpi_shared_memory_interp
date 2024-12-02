@@ -21,7 +21,7 @@ import pyvista as pv
 import numpy as np
 import math
 from multiprocessing import shared_memory
-from scipy.interpolate import RBFInterpolator
+from scipy.spatial import cKDTree
 from pathlib import Path
 
 if sys.version_info.minor < 13:
@@ -122,7 +122,7 @@ def get_output_grid() -> NDArray[np.float64]:
     cos30 = np.sqrt(3) / 2
     sin30 = 0.5
 
-    model = pv.read("/home/563/dr4292/g-adopt-mangled/demos/3d_spherical/output/output_19.vtu")
+    model = pv.read("/scratch/xd2/dr4292/3d_spherical/output_bigger_retry/output_bigger_retry_0.vtu")
     pts = np.array(model.points)
     out_grid = np.empty_like(pts)
     for i, v in enumerate(pts):
@@ -143,7 +143,8 @@ class InputDataDistributor:
             model = pv.read(fn)
             ### We need 2 shared memory buffers, one for the grid points and the other for the data
             y_global = np.array(model.points)
-            f_global = np.array(model.point_data["Pressure"])
+            f_global = np.array(model.point_data["function_12"])
+            print("Source data read")
         else:
             y_global = np.empty(1)
             f_global = np.empty(1)
@@ -155,6 +156,7 @@ class InputDataDistributor:
             self.f_shm = SharedMemoryHandler.shared_memory_create(f_size)
             self.y = np.ndarray(y_shape, dtype=y_dtype, buffer=self.y_shm.buf)
             self.f = np.ndarray(f_shape, dtype=f_dtype, buffer=self.f_shm.buf)
+            print("Shared memory regions created")
 
             if mpi.leader_comm_rank == 0:
                 self.y[:] = y_global[:]  # Copy data
@@ -162,6 +164,7 @@ class InputDataDistributor:
 
             mpi.leader_comm.Bcast([self.y, MPI.DOUBLE], root=0)
             mpi.leader_comm.Bcast([self.f, MPI.DOUBLE], root=0)
+            print("Source data distributed to remote nodes")
 
         ### Let everyone on our node find our shared memory location
         if mpi.node_comm_rank == 0:
@@ -178,16 +181,56 @@ class InputDataDistributor:
             self.f_shm = SharedMemoryHandler.shared_memory_attach(f_shm_name)
             self.y = np.ndarray(y_shape, dtype=y_dtype, buffer=self.y_shm.buf)
             self.f = np.ndarray(f_shape, dtype=f_dtype, buffer=self.f_shm.buf)
+            print("Shared memory regions attached")
 
 
-n = 256
-k = "gaussian"
-eps = 2.0
+class SiaInterpolator:
+    epsilon_distance = 1e-8
+
+    def __init__(
+        self,
+        source_grid: NDArray[np.float64],
+        source_data: NDArray[np.float64],
+        leafsize: int = 16,
+        nneighbours: int = 4,
+    ):
+        self.tree = cKDTree(data=source_grid, leafsize=leafsize)
+        self.data = source_data
+        self.nneighbours = nneighbours
+        self.source_data = source_data
+
+    def __call__(self, target_coords: NDArray[np.float64]):
+        dists, idx = self.tree.query(x=target_coords, k=self.nneighbours)
+
+        # Use np.where to avoid division by very small values
+        # Replace tiny distances with self.epsilon_distance to avoid division
+        # by tiny values while keeping original distances intact for later use
+        safe_dists = np.where(dists < self.epsilon_distance, self.epsilon_distance, dists)
+
+        # Then, calculate the weighted average using safe_dists
+        weights = self.kernel_weights(safe_dists)
+        interped = np.sum(weights * self.source_data[idx], axis=1)
+
+        close_points_mask = dists[:, 0] < self.epsilon_distance
+        # Now handle the case where points are too close to each other:
+        interped[close_points_mask] = self.source_data[idx[close_points_mask, 0]]
+        return interped
+
+    def kernel_weights(self, dist: NDArray[np.float64]) -> NDArray[np.float64]:
+        return self.normalise(1 / dist)
+
+    def normalise(self, weights: NDArray[np.float64]) -> NDArray[np.float64]:
+        return np.einsum("i, ij->ij", 1 / np.sum(weights, axis=1), weights)
+
 
 if __name__ == "__main__":
     mpi = MPI_setup()
-    input_data = InputDataDistributor("/home/563/dr4292/g-adopt-mangled/demos/3d_spherical/output/output_19.vtu", mpi)
-    interp = RBFInterpolator(input_data.y, input_data.f, neighbors=n, kernel=k, epsilon=eps)
+    input_data = InputDataDistributor(
+        "/scratch/xd2/dr4292/3d_spherical/output_bigger_retry/output_bigger_retry_0.vtu", mpi
+    )
+    ### interp = RBFInterpolator(input_data.y, input_data.f, neighbors=n, smoothing=smoothing, kernel=k, epsilon=eps)
+    interp = SiaInterpolator(input_data.y, input_data.f,nneighbours=4)
+    print("Interpolant constructed")
 
     if mpi.world_rank == 0:
         out_grid = get_output_grid()
@@ -205,21 +248,42 @@ if __name__ == "__main__":
         _ = MPI.Request.waitall(reqs)
     else:
         subgrid = mpi.comm_world.recv(source=0, tag=99)
+    print("Target grid distributed")
 
     out_f_part = interp(subgrid)
-    print(mpi.world_rank, out_f_part[-1], subgrid[-1])
+    delta = np.empty(len(out_f_part), dtype=np.float64)
+    for i, f_val in enumerate(out_f_part):
+        delta[i] = np.sqrt((f_val - known_function(subgrid[i])) ** 2)
+    print(mpi.world_rank, delta[-1], subgrid[-1])
 
-    out_parts = mpi.comm_world.gather(out_f_part, root=0)
+    delta_parts = mpi.comm_world.gather(delta, root=0)
+    out_f_parts = mpi.comm_world.gather(out_f_part, root=0)
+
+    ### Rank 0 from here on out
     if mpi.world_rank == 0:
+        out_delta = np.empty(len(out_grid), dtype=np.float64)
         out_f = np.empty(len(out_grid), dtype=np.float64)
         end = 0
-        for i, part in enumerate(out_parts):
+        for i, part in enumerate(delta_parts):
+            start = end
+            end = start + subgrid_size + (1 if i < remainder else 0)
+            out_delta[start:end] = part
+
+        end = 0
+        for i, part in enumerate(out_f_parts):
             start = end
             end = start + subgrid_size + (1 if i < remainder else 0)
             out_f[start:end] = part
 
-    if mpi.world_rank == 0:
-        print(out_f[-1], out_grid[-1])
+        # rotated = pv.PolyData(out_grid)
+        # rotated["delta"] = out_f
+        # rotated.save("/scratch/xd2/dr4292/3d_spherical/delta.vtp")
+        print("=================================================================")
+        inds = np.argsort(out_delta)
+        for i in range(300):
+            print(out_delta[inds[::-1]][i], out_f[inds[::-1]][i], inds[::-1][i])
+
+        print("Average error: ", sum(out_delta) / len(out_delta))
 
     mpi.comm_world.Barrier()
 
