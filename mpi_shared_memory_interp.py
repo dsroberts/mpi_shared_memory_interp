@@ -118,18 +118,8 @@ def known_function(coords: NDArray[np.float64]) -> np.float64:
 
 
 def get_output_grid() -> NDArray[np.float64]:
-    ### In this case, we're just going to rotate the input grid by 30 degrees
-    cos30 = np.sqrt(3) / 2
-    sin30 = 0.5
-
-    model = pv.read("/scratch/xd2/dr4292/3d_spherical/output_bigger_retry/output_bigger_retry_0.vtu")
-    pts = np.array(model.points)
-    out_grid = np.empty_like(pts)
-    for i, v in enumerate(pts):
-        out_grid[i][0] = v[0] * cos30 - v[1] * sin30
-        out_grid[i][1] = v[0] * sin30 + v[1] * cos30
-        out_grid[i][2] = v[2]
-    return out_grid
+    ### In this case, we're just going to read a new mesh
+    return pv.read("/home/563/dr4292/g-adopt/mesh/mesh_0.vtu")
 
 
 class InputDataDistributor:
@@ -143,7 +133,7 @@ class InputDataDistributor:
             model = pv.read(fn)
             ### We need 2 shared memory buffers, one for the grid points and the other for the data
             y_global = np.array(model.points)
-            f_global = np.array(model.point_data["function_12"])
+            f_global = np.array(model.point_data["Temperature_Deviation_CG"])
             print("Source data read")
         else:
             y_global = np.empty(1)
@@ -225,15 +215,14 @@ class SiaInterpolator:
 
 if __name__ == "__main__":
     mpi = MPI_setup()
-    input_data = InputDataDistributor(
-        "/scratch/xd2/dr4292/3d_spherical/output_bigger_retry/output_bigger_retry_0.vtu", mpi
-    )
+    input_data = InputDataDistributor("/scratch/xd2/dr4292/mantle_plumes/output_0.pvtu", mpi)
     ### interp = RBFInterpolator(input_data.y, input_data.f, neighbors=n, smoothing=smoothing, kernel=k, epsilon=eps)
-    interp = SiaInterpolator(input_data.y, input_data.f,nneighbours=4)
+    interp = SiaInterpolator(input_data.y, input_data.f, nneighbours=4)
     print("Interpolant constructed")
 
     if mpi.world_rank == 0:
-        out_grid = get_output_grid()
+        out_model = get_output_grid()
+        out_grid = np.array(out_model.points)
         # Distribute outgrid points
         reqs = []
         subgrid_size = len(out_grid) // mpi.world_size
@@ -251,23 +240,23 @@ if __name__ == "__main__":
     print("Target grid distributed")
 
     out_f_part = interp(subgrid)
-    delta = np.empty(len(out_f_part), dtype=np.float64)
-    for i, f_val in enumerate(out_f_part):
-        delta[i] = np.sqrt((f_val - known_function(subgrid[i])) ** 2)
-    print(mpi.world_rank, delta[-1], subgrid[-1])
+    ### delta = np.empty(len(out_f_part), dtype=np.float64)
+    ### for i, f_val in enumerate(out_f_part):
+    ###     delta[i] = np.sqrt((f_val - known_function(subgrid[i])) ** 2)
+    ### print(mpi.world_rank, delta[-1], subgrid[-1])
 
-    delta_parts = mpi.comm_world.gather(delta, root=0)
+    ### delta_parts = mpi.comm_world.gather(delta, root=0)
     out_f_parts = mpi.comm_world.gather(out_f_part, root=0)
 
     ### Rank 0 from here on out
     if mpi.world_rank == 0:
-        out_delta = np.empty(len(out_grid), dtype=np.float64)
+        ### out_delta = np.empty(len(out_grid), dtype=np.float64)
         out_f = np.empty(len(out_grid), dtype=np.float64)
         end = 0
-        for i, part in enumerate(delta_parts):
-            start = end
-            end = start + subgrid_size + (1 if i < remainder else 0)
-            out_delta[start:end] = part
+        ### for i, part in enumerate(delta_parts):
+        ###     start = end
+        ###     end = start + subgrid_size + (1 if i < remainder else 0)
+        ###     out_delta[start:end] = part
 
         end = 0
         for i, part in enumerate(out_f_parts):
@@ -275,15 +264,16 @@ if __name__ == "__main__":
             end = start + subgrid_size + (1 if i < remainder else 0)
             out_f[start:end] = part
 
-        # rotated = pv.PolyData(out_grid)
-        # rotated["delta"] = out_f
-        # rotated.save("/scratch/xd2/dr4292/3d_spherical/delta.vtp")
+        downscaled = pv.UnstructuredGrid()
+        downscaled.copy_structure(out_model)
+        downscaled["Temperature_Deviation_CG"] = out_f
+        downscaled.save("/scratch/xd2/dr4292/downscaled.vtu")
         print("=================================================================")
-        inds = np.argsort(out_delta)
-        for i in range(300):
-            print(out_delta[inds[::-1]][i], out_f[inds[::-1]][i], inds[::-1][i])
+        ### inds = np.argsort(out_delta)
+        ### for i in range(300):
+        ###     print(out_delta[inds[::-1]][i], out_f[inds[::-1]][i], inds[::-1][i])
 
-        print("Average error: ", sum(out_delta) / len(out_delta))
+        ### print("Average error: ", sum(out_delta) / len(out_delta))
 
     mpi.comm_world.Barrier()
 
