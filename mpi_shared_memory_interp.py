@@ -23,9 +23,22 @@ import math
 from multiprocessing import shared_memory
 from scipy.spatial import cKDTree
 from pathlib import Path
+import vtk
+import argparse
 
 if sys.version_info.minor < 13:
     from multiprocessing import resource_tracker
+
+
+# Do some post processing with pyvista
+def post_processor(ds):
+    surface = pv.Sphere(radius=1.23)
+    surface = vtk.vtkSphere()
+    surface.SetRadius(1.23)
+    clipped = ds.slice_implicit(surface, generate_triangles=True)
+    surf = ds.contour([-0.075, 0.075])
+    smoothed = surf.smooth_taubin(n_iter=100, pass_band=0.25)
+    return pv.merge([clipped, smoothed])
 
 
 class MPI_setup:
@@ -117,9 +130,9 @@ def known_function(coords: NDArray[np.float64]) -> np.float64:
     )
 
 
-def get_output_grid() -> NDArray[np.float64]:
+def get_output_grid(fn: str) -> NDArray[np.float64]:
     ### In this case, we're just going to read a new mesh
-    return pv.read("/home/563/dr4292/g-adopt/mesh/mesh_0.vtu")
+    return pv.read(fn)
 
 
 class InputDataDistributor:
@@ -128,12 +141,12 @@ class InputDataDistributor:
     y_shm: Optional[SharedMemoryHandler] = None
     f_shm: Optional[SharedMemoryHandler] = None
 
-    def __init__(self, fn: Union[str, Path], mpi):
+    def __init__(self, fn: Union[str, Path], mpi, field: str):
         if mpi.world_rank == 0:
             model = pv.read(fn)
             ### We need 2 shared memory buffers, one for the grid points and the other for the data
             y_global = np.array(model.points)
-            f_global = np.array(model.point_data["Temperature_Deviation_CG"])
+            f_global = np.array(model.point_data[field])
             print("Source data read")
         else:
             y_global = np.empty(1)
@@ -182,7 +195,7 @@ class SiaInterpolator:
         source_grid: NDArray[np.float64],
         source_data: NDArray[np.float64],
         leafsize: int = 16,
-        nneighbours: int = 4,
+        nneighbours: int = 16,
     ):
         self.tree = cKDTree(data=source_grid, leafsize=leafsize)
         self.data = source_data
@@ -207,21 +220,34 @@ class SiaInterpolator:
         return interped
 
     def kernel_weights(self, dist: NDArray[np.float64]) -> NDArray[np.float64]:
-        return self.normalise(1 / dist)
+        return self.normalise(np.exp(-(dist**2)))
+        # return self.normalise(1 / dist)
 
     def normalise(self, weights: NDArray[np.float64]) -> NDArray[np.float64]:
         return np.einsum("i, ij->ij", 1 / np.sum(weights, axis=1), weights)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="mpi_shared_memory_interp.py", description="Interpolates a large pvtu file onto a smaller grid"
+    )
+    parser.add_argument("-i", "--infile", required=True, help="The input file to interpolate")
+    parser.add_argument(
+        "-g", "--input_grid", required=True, help="The input file containing the grid to interpolate to"
+    )
+    parser.add_argument("-o", "--outfile", required=True, help="Path to the final output")
+    parser.add_argument("-f", "--field",required=True, help="Name of field to be interpolated")
+
+    ns = parser.parse_args(sys.argv[1:])
+
     mpi = MPI_setup()
-    input_data = InputDataDistributor("/scratch/xd2/dr4292/mantle_plumes/output_0.pvtu", mpi)
+    input_data = InputDataDistributor(ns.infile, mpi, ns.field)
     ### interp = RBFInterpolator(input_data.y, input_data.f, neighbors=n, smoothing=smoothing, kernel=k, epsilon=eps)
-    interp = SiaInterpolator(input_data.y, input_data.f, nneighbours=4)
+    interp = SiaInterpolator(input_data.y, input_data.f, nneighbours=32)
     print("Interpolant constructed")
 
     if mpi.world_rank == 0:
-        out_model = get_output_grid()
+        out_model = get_output_grid(ns.input_grid)
         out_grid = np.array(out_model.points)
         # Distribute outgrid points
         reqs = []
@@ -252,7 +278,7 @@ if __name__ == "__main__":
     if mpi.world_rank == 0:
         ### out_delta = np.empty(len(out_grid), dtype=np.float64)
         out_f = np.empty(len(out_grid), dtype=np.float64)
-        end = 0
+        ### end = 0
         ### for i, part in enumerate(delta_parts):
         ###     start = end
         ###     end = start + subgrid_size + (1 if i < remainder else 0)
@@ -266,8 +292,11 @@ if __name__ == "__main__":
 
         downscaled = pv.UnstructuredGrid()
         downscaled.copy_structure(out_model)
-        downscaled["Temperature_Deviation_CG"] = out_f
-        downscaled.save("/scratch/xd2/dr4292/downscaled.vtu")
+        downscaled[field] = out_f
+
+        # post_processor(downscaled).save("/scratch/xd2/dr4292/postproc_downscaled_l5_surfonly.vtp")
+        downscaled.save(ns.outfile)
+
         print("=================================================================")
         ### inds = np.argsort(out_delta)
         ### for i in range(300):
