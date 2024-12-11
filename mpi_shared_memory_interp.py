@@ -292,7 +292,7 @@ if __name__ == "__main__":
 
         downscaled = pv.UnstructuredGrid()
         downscaled.copy_structure(out_model)
-        downscaled[field] = out_f
+        downscaled[ns.field] = out_f
 
         # post_processor(downscaled).save("/scratch/xd2/dr4292/postproc_downscaled_l5_surfonly.vtp")
         downscaled.save(ns.outfile)
