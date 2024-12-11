@@ -141,38 +141,33 @@ class InputDataDistributor:
     y_shm: Optional[SharedMemoryHandler] = None
     f_shm: Optional[SharedMemoryHandler] = None
 
-    def __init__(self, fn: Union[str, Path], mpi, field: str):
+    def __init__(self, fn: Union[str, Path], mpi):
+        self.mpi = mpi
         if mpi.world_rank == 0:
-            model = pv.read(fn)
+            self.model = pv.read(fn)
             ### We need 2 shared memory buffers, one for the grid points and the other for the data
-            y_global = np.array(model.points)
-            f_global = np.array(model.point_data[field])
+            y_global = np.array(self.model.points)
             print("Source data read")
         else:
             y_global = np.empty(1)
-            f_global = np.empty(1)
+
         y_size, y_shape, y_dtype = mpi.comm_world.bcast((y_global.nbytes, y_global.shape, y_global.dtype), root=0)
-        f_size, f_shape, f_dtype = mpi.comm_world.bcast((f_global.nbytes, f_global.shape, f_global.dtype), root=0)
 
         if mpi.leader_comm != MPI.COMM_NULL:
             self.y_shm = SharedMemoryHandler.shared_memory_create(y_size)
-            self.f_shm = SharedMemoryHandler.shared_memory_create(f_size)
             self.y = np.ndarray(y_shape, dtype=y_dtype, buffer=self.y_shm.buf)
-            self.f = np.ndarray(f_shape, dtype=f_dtype, buffer=self.f_shm.buf)
             print("Shared memory regions created")
 
             if mpi.leader_comm_rank == 0:
                 self.y[:] = y_global[:]  # Copy data
-                self.f[:] = f_global[:]  # Copy data
-
+                
             mpi.leader_comm.Bcast([self.y, MPI.DOUBLE], root=0)
-            mpi.leader_comm.Bcast([self.f, MPI.DOUBLE], root=0)
+            
             print("Source data distributed to remote nodes")
 
         ### Let everyone on our node find our shared memory location
-        if mpi.node_comm_rank == 0:
+        
             y_shm_name = self.y_shm.name
-            f_shm_name = self.f_shm.name
         else:
             y_shm_name = None
             f_shm_name = None
@@ -181,11 +176,33 @@ class InputDataDistributor:
 
         if mpi.node_comm_rank != 0:
             self.y_shm = SharedMemoryHandler.shared_memory_attach(y_shm_name)
-            self.f_shm = SharedMemoryHandler.shared_memory_attach(f_shm_name)
             self.y = np.ndarray(y_shape, dtype=y_dtype, buffer=self.y_shm.buf)
-            self.f = np.ndarray(f_shape, dtype=f_dtype, buffer=self.f_shm.buf)
+            
             print("Shared memory regions attached")
 
+    def distribute_field(self, field: str):
+        if mpi.world_rank == 0:
+            f_global = np.array(self.model.point_data[field])
+        else:
+            f_global = np.empty(1)
+        f_size, f_shape, f_dtype = self.mpi.comm_world.bcast((f_global.nbytes, f_global.shape, f_global.dtype), root=0)
+        if mpi.leader_comm != MPI.COMM_NULL:
+            if self.f_shm is None:
+                self.f_shm = SharedMemoryHandler.shared_memory_create(f_size)
+                self.f = np.ndarray(f_shape, dtype=f_dtype, buffer=self.f_shm.buf)
+        
+            if mpi.leader_comm_rank == 0:
+                self.f[:] = f_global[:]  # Copy data
+            mpi.leader_comm.Bcast([self.f, MPI.DOUBLE], root=0)
+            f_shm_name = self.f_shm.name
+        f_shm_name = mpi.node_comm.bcast(f_shm_name, root=0)
+        
+        if mpi.node_comm_rank != 0:
+            if self.f_shm is None:
+                self.f_shm = SharedMemoryHandler.shared_memory_attach(f_shm_name)
+                self.f = np.ndarray(f_shape, dtype=f_dtype, buffer=self.f_shm.buf)
+
+                
 
 class SiaInterpolator:
     epsilon_distance = 1e-8
@@ -236,9 +253,11 @@ if __name__ == "__main__":
         "-g", "--input_grid", required=True, help="The input file containing the grid to interpolate to"
     )
     parser.add_argument("-o", "--outfile", required=True, help="Path to the final output")
-    parser.add_argument("-f", "--field",required=True, help="Name of field to be interpolated")
+    parser.add_argument("-f", "--field",required=True, help="Name(s) of field to be interpolated, comma separated")
 
     ns = parser.parse_args(sys.argv[1:])
+
+    fields=ns.field.split(',')
 
     mpi = MPI_setup()
     input_data = InputDataDistributor(ns.infile, mpi, ns.field)
@@ -249,6 +268,8 @@ if __name__ == "__main__":
     if mpi.world_rank == 0:
         out_model = get_output_grid(ns.input_grid)
         out_grid = np.array(out_model.points)
+        downscaled = pv.UnstructuredGrid()
+        downscaled.copy_structure(out_model)
         # Distribute outgrid points
         reqs = []
         subgrid_size = len(out_grid) // mpi.world_size
@@ -265,44 +286,28 @@ if __name__ == "__main__":
         subgrid = mpi.comm_world.recv(source=0, tag=99)
     print("Target grid distributed")
 
-    out_f_part = interp(subgrid)
-    ### delta = np.empty(len(out_f_part), dtype=np.float64)
-    ### for i, f_val in enumerate(out_f_part):
-    ###     delta[i] = np.sqrt((f_val - known_function(subgrid[i])) ** 2)
-    ### print(mpi.world_rank, delta[-1], subgrid[-1])
+    for field in fields:
 
-    ### delta_parts = mpi.comm_world.gather(delta, root=0)
-    out_f_parts = mpi.comm_world.gather(out_f_part, root=0)
+        input_data.distribute_field(field)
+        out_f_part = interp(subgrid)
+        out_f_parts = mpi.comm_world.gather(out_f_part, root=0)
 
-    ### Rank 0 from here on out
-    if mpi.world_rank == 0:
-        ### out_delta = np.empty(len(out_grid), dtype=np.float64)
-        out_f = np.empty(len(out_grid), dtype=np.float64)
-        ### end = 0
-        ### for i, part in enumerate(delta_parts):
-        ###     start = end
-        ###     end = start + subgrid_size + (1 if i < remainder else 0)
-        ###     out_delta[start:end] = part
+        ### Rank 0 from here on out
+        if mpi.world_rank == 0:
+            out_f = np.empty(len(out_grid), dtype=np.float64)
 
-        end = 0
-        for i, part in enumerate(out_f_parts):
-            start = end
-            end = start + subgrid_size + (1 if i < remainder else 0)
-            out_f[start:end] = part
+            end = 0
+            for i, part in enumerate(out_f_parts):
+                start = end
+                end = start + subgrid_size + (1 if i < remainder else 0)
+                out_f[start:end] = part
 
-        downscaled = pv.UnstructuredGrid()
-        downscaled.copy_structure(out_model)
-        downscaled[ns.field] = out_f
+            downscaled[ns.field] = out_f
 
         # post_processor(downscaled).save("/scratch/xd2/dr4292/postproc_downscaled_l5_surfonly.vtp")
         downscaled.save(ns.outfile)
 
         print("=================================================================")
-        ### inds = np.argsort(out_delta)
-        ### for i in range(300):
-        ###     print(out_delta[inds[::-1]][i], out_f[inds[::-1]][i], inds[::-1][i])
-
-        ### print("Average error: ", sum(out_delta) / len(out_delta))
 
     mpi.comm_world.Barrier()
 
