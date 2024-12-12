@@ -160,24 +160,22 @@ class InputDataDistributor:
 
             if mpi.leader_comm_rank == 0:
                 self.y[:] = y_global[:]  # Copy data
-                
+
             mpi.leader_comm.Bcast([self.y, MPI.DOUBLE], root=0)
-            
+
             print("Source data distributed to remote nodes")
 
-        ### Let everyone on our node find our shared memory location
-        
+            ### Let everyone on our node find our shared memory location
+
             y_shm_name = self.y_shm.name
         else:
             y_shm_name = None
-            f_shm_name = None
         y_shm_name = mpi.node_comm.bcast(y_shm_name, root=0)
-        f_shm_name = mpi.node_comm.bcast(f_shm_name, root=0)
 
         if mpi.node_comm_rank != 0:
             self.y_shm = SharedMemoryHandler.shared_memory_attach(y_shm_name)
             self.y = np.ndarray(y_shape, dtype=y_dtype, buffer=self.y_shm.buf)
-            
+
             print("Shared memory regions attached")
 
     def distribute_field(self, field: str):
@@ -190,19 +188,20 @@ class InputDataDistributor:
             if self.f_shm is None:
                 self.f_shm = SharedMemoryHandler.shared_memory_create(f_size)
                 self.f = np.ndarray(f_shape, dtype=f_dtype, buffer=self.f_shm.buf)
-        
+
             if mpi.leader_comm_rank == 0:
                 self.f[:] = f_global[:]  # Copy data
             mpi.leader_comm.Bcast([self.f, MPI.DOUBLE], root=0)
             f_shm_name = self.f_shm.name
+        else:
+            f_shm_name = None
         f_shm_name = mpi.node_comm.bcast(f_shm_name, root=0)
-        
+
         if mpi.node_comm_rank != 0:
             if self.f_shm is None:
                 self.f_shm = SharedMemoryHandler.shared_memory_attach(f_shm_name)
                 self.f = np.ndarray(f_shape, dtype=f_dtype, buffer=self.f_shm.buf)
 
-                
 
 class SiaInterpolator:
     epsilon_distance = 1e-8
@@ -210,14 +209,14 @@ class SiaInterpolator:
     def __init__(
         self,
         source_grid: NDArray[np.float64],
-        source_data: NDArray[np.float64],
         leafsize: int = 16,
         nneighbours: int = 16,
     ):
         self.tree = cKDTree(data=source_grid, leafsize=leafsize)
-        self.data = source_data
         self.nneighbours = nneighbours
-        self.source_data = source_data
+
+    def set_field(self, data: NDArray[np.float64]):
+        self.source_data = data
 
     def __call__(self, target_coords: NDArray[np.float64]):
         dists, idx = self.tree.query(x=target_coords, k=self.nneighbours)
@@ -253,16 +252,16 @@ if __name__ == "__main__":
         "-g", "--input_grid", required=True, help="The input file containing the grid to interpolate to"
     )
     parser.add_argument("-o", "--outfile", required=True, help="Path to the final output")
-    parser.add_argument("-f", "--field",required=True, help="Name(s) of field to be interpolated, comma separated")
+    parser.add_argument("-f", "--field", required=True, help="Name(s) of field to be interpolated, comma separated")
 
     ns = parser.parse_args(sys.argv[1:])
 
-    fields=ns.field.split(',')
+    fields = ns.field.split(",")
 
     mpi = MPI_setup()
-    input_data = InputDataDistributor(ns.infile, mpi, ns.field)
+    input_data = InputDataDistributor(ns.infile, mpi)
     ### interp = RBFInterpolator(input_data.y, input_data.f, neighbors=n, smoothing=smoothing, kernel=k, epsilon=eps)
-    interp = SiaInterpolator(input_data.y, input_data.f, nneighbours=32)
+    interp = SiaInterpolator(input_data.y, nneighbours=32)
     print("Interpolant constructed")
 
     if mpi.world_rank == 0:
@@ -287,8 +286,8 @@ if __name__ == "__main__":
     print("Target grid distributed")
 
     for field in fields:
-
         input_data.distribute_field(field)
+        interp.set_field(input_data.f)
         out_f_part = interp(subgrid)
         out_f_parts = mpi.comm_world.gather(out_f_part, root=0)
 
@@ -302,13 +301,13 @@ if __name__ == "__main__":
                 end = start + subgrid_size + (1 if i < remainder else 0)
                 out_f[start:end] = part
 
-            downscaled[ns.field] = out_f
+            downscaled[field] = out_f
 
-        # post_processor(downscaled).save("/scratch/xd2/dr4292/postproc_downscaled_l5_surfonly.vtp")
+        mpi.comm_world.Barrier()
+
+            # post_processor(downscaled).save("/scratch/xd2/dr4292/postproc_downscaled_l5_surfonly.vtp")
+    if mpi.world_rank == 0:
         downscaled.save(ns.outfile)
-
         print("=================================================================")
-
-    mpi.comm_world.Barrier()
 
     del input_data
