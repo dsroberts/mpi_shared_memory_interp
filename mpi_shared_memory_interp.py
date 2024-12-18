@@ -180,17 +180,20 @@ class InputDataDistributor:
 
     def distribute_field(self, field: str):
         if mpi.world_rank == 0:
-            f_global = np.array(self.model.point_data[field])
+            f_global = np.array(self.model[field])
         else:
             f_global = np.empty(1)
         f_size, f_shape, f_dtype = self.mpi.comm_world.bcast((f_global.nbytes, f_global.shape, f_global.dtype), root=0)
         if mpi.leader_comm != MPI.COMM_NULL:
+            if self.f_shm is not None:
+                if self.f_shm.size != f_size:
+                    del self.f_shm
             if self.f_shm is None:
                 self.f_shm = SharedMemoryHandler.shared_memory_create(f_size)
                 self.f = np.ndarray(f_shape, dtype=f_dtype, buffer=self.f_shm.buf)
 
             if mpi.leader_comm_rank == 0:
-                self.f[:] = f_global[:]  # Copy data
+                np.copyto(self.f, f_global, casting="no")
             mpi.leader_comm.Bcast([self.f, MPI.DOUBLE], root=0)
             f_shm_name = self.f_shm.name
         else:
@@ -198,6 +201,9 @@ class InputDataDistributor:
         f_shm_name = mpi.node_comm.bcast(f_shm_name, root=0)
 
         if mpi.node_comm_rank != 0:
+            if self.f_shm is not None:
+                if self.f_shm.name != f_shm_name:
+                    del self.f_shm
             if self.f_shm is None:
                 self.f_shm = SharedMemoryHandler.shared_memory_attach(f_shm_name)
                 self.f = np.ndarray(f_shape, dtype=f_dtype, buffer=self.f_shm.buf)
@@ -215,11 +221,9 @@ class SiaInterpolator:
         self.tree = cKDTree(data=source_grid, leafsize=leafsize)
         self.nneighbours = nneighbours
 
-    def set_field(self, data: NDArray[np.float64]):
-        self.source_data = data
-
-    def __call__(self, target_coords: NDArray[np.float64]):
+    def __call__(self, target_coords: NDArray[np.float64], data: NDArray[np.float64]):
         dists, idx = self.tree.query(x=target_coords, k=self.nneighbours)
+        close_points_mask = dists[:, 0] < self.epsilon_distance
 
         # Use np.where to avoid division by very small values
         # Replace tiny distances with self.epsilon_distance to avoid division
@@ -228,11 +232,12 @@ class SiaInterpolator:
 
         # Then, calculate the weighted average using safe_dists
         weights = self.kernel_weights(safe_dists)
-        interped = np.sum(weights * self.source_data[idx], axis=1)
+        if len(data.shape) == 2:
+            weights = weights[:, :, np.newaxis]
+        interped = np.sum(weights * data[idx], axis=1)
 
-        close_points_mask = dists[:, 0] < self.epsilon_distance
         # Now handle the case where points are too close to each other:
-        interped[close_points_mask] = self.source_data[idx[close_points_mask, 0]]
+        interped[close_points_mask] = data[idx[close_points_mask, 0]]
         return interped
 
     def kernel_weights(self, dist: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -252,14 +257,20 @@ if __name__ == "__main__":
         "-g", "--input_grid", required=True, help="The input file containing the grid to interpolate to"
     )
     parser.add_argument("-o", "--outfile", required=True, help="Path to the final output")
-    parser.add_argument("-f", "--field", required=True, help="Name(s) of field to be interpolated, comma separated")
+    parser.add_argument("-f", "--field", required=False, help="Name(s) of field to be interpolated, comma separated")
 
     ns = parser.parse_args(sys.argv[1:])
 
-    fields = ns.field.split(",")
-
     mpi = MPI_setup()
     input_data = InputDataDistributor(ns.infile, mpi)
+    if ns.field:
+        fields = ns.field.split(",")
+    else:
+        if mpi.world_rank == 0:
+            fields = input_data.model.array_names
+        else:
+            fields = []
+        fields = mpi.comm_world.bcast(fields, root=0)
     ### interp = RBFInterpolator(input_data.y, input_data.f, neighbors=n, smoothing=smoothing, kernel=k, epsilon=eps)
     interp = SiaInterpolator(input_data.y, nneighbours=32)
     print("Interpolant constructed")
@@ -287,14 +298,12 @@ if __name__ == "__main__":
 
     for field in fields:
         input_data.distribute_field(field)
-        interp.set_field(input_data.f)
-        out_f_part = interp(subgrid)
+        out_f_part = interp(subgrid, input_data.f)
         out_f_parts = mpi.comm_world.gather(out_f_part, root=0)
 
         ### Rank 0 from here on out
         if mpi.world_rank == 0:
-            out_f = np.empty(len(out_grid), dtype=np.float64)
-
+            out_f = np.empty([len(out_grid)] + list(input_data.model[field].shape[1:]), dtype=np.float64)
             end = 0
             for i, part in enumerate(out_f_parts):
                 start = end
@@ -305,7 +314,7 @@ if __name__ == "__main__":
 
         mpi.comm_world.Barrier()
 
-            # post_processor(downscaled).save("/scratch/xd2/dr4292/postproc_downscaled_l5_surfonly.vtp")
+        # post_processor(downscaled).save("/scratch/xd2/dr4292/postproc_downscaled_l5_surfonly.vtp")
     if mpi.world_rank == 0:
         downscaled.save(ns.outfile)
         print("=================================================================")
