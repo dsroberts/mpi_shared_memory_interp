@@ -14,7 +14,6 @@
 ###      expand to other hardware units in time
 from mpi4py import MPI
 import sys
-from socket import gethostname
 from typing import Callable, List, Union, Optional
 from numpy.typing import NDArray
 import pyvista as pv
@@ -45,9 +44,7 @@ class MPI_setup:
     comm_world = MPI.COMM_WORLD
     world_rank = comm_world.Get_rank()
     world_size = comm_world.Get_size()
-    host = gethostname()
     ops: dict[str, Callable] = {}
-    node_list: List[str] = []
     node_comm = MPI.COMM_NULL
     node_comm_rank = -1
     node_comm_size = -1
@@ -59,22 +56,18 @@ class MPI_setup:
         self.setup_mpi()
 
     def setup_mpi(self) -> None:
-        ### How many physical nodes are we on?
-        proc_hosts = self.comm_world.allgather(self.host)
-        self.node_list = list(dict.fromkeys(proc_hosts))
-
-        node_comm_colour = self.node_list.index(self.host)
-        node_comm_rank = self.world_rank - proc_hosts.index(self.host)
-
-        self.node_comm = self.comm_world.Split(node_comm_colour, node_comm_rank)
+        ### Setup shared memory communicators
+        self.node_comm = self.comm_world.Split_type(MPI.COMM_TYPE_SHARED)
         self.node_comm_rank = self.node_comm.Get_rank()
         self.node_comm_size = self.node_comm.Get_size()
 
         ### Now setup a leader comm
         leader_group = MPI.Group(self.comm_world.Get_group())
-        leaders = []
-        for node in self.node_list:
-            leaders.append(proc_hosts.index(node))
+        to_gather=-1
+        if self.node_comm_rank == 0:
+            to_gather=self.world_rank
+        leaders = list(dict.fromkeys(self.comm_world.allgather(to_gather)))
+        leaders.remove(-1)
         leader_group = leader_group.Incl(leaders)
         self.leader_comm = self.comm_world.Create(leader_group)
         if self.leader_comm != MPI.COMM_NULL:
